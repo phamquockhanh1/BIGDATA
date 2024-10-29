@@ -1,0 +1,232 @@
+import java.io.*;
+import java.util.*;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.*;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+
+public class KMeansClustering {
+
+    // Lớp Mapper
+    public static class KMeansMapper extends Mapper<LongWritable, Text, IntWritable, Text> {
+        private List<double[]> centroids = new ArrayList<>();
+
+        @Override
+        protected void setup(Context context) throws IOException, InterruptedException {
+            // Tải tâm cụm từ các cụm định trước
+            centroids = loadCentroids();
+        }
+
+        @Override
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            String line = value.toString();
+            if (line.startsWith("id") || line.contains("age")) {
+                return; // Bỏ qua nếu là dòng tiêu đề
+            }
+
+            String[] data = line.split(",");
+            double[] point = cleanAndParseData(data);
+
+            if (point != null) { // Chỉ xử lý điểm hợp lệ
+                int closestCentroid = getClosestCentroid(point);
+                context.write(new IntWritable(closestCentroid), value);
+            }
+        }
+
+        // Hàm làm sạch và chuyển đổi dữ liệu
+        private double[] cleanAndParseData(String[] data) {
+            try {
+                // Chuyển đổi các giá trị và xử lý thiếu/không hợp lệee
+                double age = Double.parseDouble(data[2]);
+                double hypertension = Double.parseDouble(data[3]);
+                double heartDisease = Double.parseDouble(data[4]);
+                double bmi = data[9].equals("N/A") ? 0 : Double.parseDouble(data[9]);
+                double avgGlucoseLevel = Double.parseDouble(data[8]);
+
+                // Kiểm tra tính hợp lệ của dữ liệu
+                if (age <= 0 || bmi < 0 || avgGlucoseLevel < 0) return null;
+
+                // Chuẩn hóa dữ liệu (optional)
+                age = age / 100; // Giả sử tuổi từ 0-100
+                bmi = bmi / 50;  // Giả sử BMI từ 0-50
+                avgGlucoseLevel = avgGlucoseLevel / 300; // Giả sử mức đường huyết từ 0-300
+
+                return new double[]{age, hypertension, heartDisease, bmi, avgGlucoseLevel};
+
+            } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+                System.err.println("Lỗi khi phân tích dữ liệu: " + e.getMessage());
+                return null; // Bỏ qua dòng nếu có lỗi phân tích
+            }
+        }
+
+        private int getClosestCentroid(double[] point) {
+            int closest = -1;
+            double minDistance = Double.MAX_VALUE;
+
+            for (int i = 0; i < centroids.size(); i++) {
+                double distance = getDistance(point, centroids.get(i));
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closest = i;
+                }
+            }
+            return closest;
+        }
+
+        private double getDistance(double[] point, double[] centroid) {
+            double sum = 0;
+            for (int i = 0; i < point.length; i++) {
+                sum += Math.pow(point[i] - centroid[i], 2);
+            }
+            return Math.sqrt(sum);
+        }
+
+        private List<double[]> loadCentroids() {
+            return Arrays.asList(
+                new double[]{0.5, 0, 0, 0.5, 0.33},  // Cụm không có nguy cơ đột quỵ (chuẩn hóa)
+                new double[]{0.7, 1, 1, 0.6, 0.67}   // Cụm có nguy cơ đột quỵ (chuẩn hóa)
+            );
+        }
+    }
+
+    // Lớp Reducer
+    public static class KMeansReducer extends Reducer<IntWritable, Text, IntWritable, Text> {
+        @Override
+        public void reduce(IntWritable key, Iterable<Text> values, Context context) throws IOException, InterruptedException {
+            List<double[]> points = new ArrayList<>();
+            int pointCount = 0;
+
+            for (Text value : values) {
+                String[] data = value.toString().split(",");
+                double[] point = new double[] {
+                    Double.parseDouble(data[2]),  // tuổi
+                    Double.parseDouble(data[3]),  // tăng huyết áp
+                    Double.parseDouble(data[4]),  // bệnh tim
+                    data[9].equals("N/A") ? 0 : Double.parseDouble(data[9]),  // bmi
+                    Double.parseDouble(data[8])   // mức đường huyết trung bình
+                };
+                points.add(point);
+                pointCount++;
+            }
+
+            double[] newCentroid = new double[5];
+            for (double[] point : points) {
+                for (int i = 0; i < point.length; i++) {
+                    newCentroid[i] += point[i];
+                }
+            }
+            for (int i = 0; i < newCentroid.length; i++) {
+                newCentroid[i] /= points.size();
+            }
+
+            String centroidInfo = "Tâm cụm: " + Arrays.toString(newCentroid) + ", Số điểm trong cụm: " + pointCount;
+            context.write(key, new Text(centroidInfo));
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.setProperty("file.encoding", "UTF-8");
+        Configuration conf = new Configuration();
+        Job job = Job.getInstance(conf, "KMeans Clustering");
+        job.setJarByClass(KMeansClustering.class);
+        job.setMapperClass(KMeansMapper.class);
+        job.setReducerClass(KMeansReducer.class);
+        job.setOutputKeyClass(IntWritable.class);
+        job.setOutputValueClass(Text.class);
+
+        FileInputFormat.addInputPath(job, new Path(args[0]));
+        FileOutputFormat.setOutputPath(job, new Path(args[1]));
+
+        if (job.waitForCompletion(true)) {
+            Path outputPath = new Path(args[1] + "/part-r-00000");
+            displayClusters(outputPath);
+            openCmdForUserInput();
+        }
+    }
+
+    private static void displayClusters(Path outputPath) {
+        try (BufferedReader br = new BufferedReader(new FileReader(outputPath.toString()))) {
+            String line;
+            System.out.println("Thông tin các cụm sau khi xử lý:");
+            while ((line = br.readLine()) != null) {
+                System.out.println(line);
+            }
+        } catch (IOException e) {
+            System.err.println("... " + e.getMessage());
+        }
+    }
+
+    private static void openCmdForUserInput() {
+        try {
+            Scanner scanner = new Scanner(System.in);
+
+            System.out.println("Nhập Tuổi:");
+            double age = scanner.nextDouble();
+
+            System.out.println("Bạn có bị tăng huyết áp không? (1 có, 0 không):");
+            int hypertension = scanner.nextInt();
+
+            System.out.println("Bạn có bị bệnh tim không? (1 có, 0 không):");
+            int heartDisease = scanner.nextInt();
+
+            System.out.println("Nhập BMI của bạn:");
+            double bmi = scanner.nextDouble();
+
+            System.out.println("Nhập mức đường huyết trung bình:");
+            double avgGlucoseLevel = scanner.nextDouble();
+
+            double[] userPoint = new double[]{age / 100, hypertension, heartDisease, bmi / 50, avgGlucoseLevel / 300};
+            int closestCluster = getClosestCentroid(userPoint);
+            boolean hasStroke = predictStroke(closestCluster);
+
+            if (hasStroke) {
+                System.out.println("Bạn có nguy cơ bị đột quỵ.");
+            } else {
+                System.out.println("Bạn không có nguy cơ bị đột quỵ.");
+            }
+
+        } catch (InputMismatchException e) {
+            System.err.println("Dữ liệu không hợp lệ. Vui lòng nhập đúng định dạng.");
+        } catch (NoSuchElementException e) {
+            System.err.println("Thiếu dữ liệu đầu vào. Vui lòng cung cấp đầy đủ thông tin.");
+        }
+    }
+
+    private static int getClosestCentroid(double[] point) {
+        List<double[]> centroids = loadCentroids();
+        int closest = -1;
+        double minDistance = Double.MAX_VALUE;
+
+        for (int i = 0; i < centroids.size(); i++) {
+            double distance = getDistance(point, centroids.get(i));
+            if (distance < minDistance) {
+                minDistance = distance;
+                closest = i;
+            }
+        }
+        return closest;
+    }
+
+    private static double getDistance(double[] point, double[] centroid) {
+        double sum = 0;
+        for (int i = 0; i < point.length; i++) {
+            sum += Math.pow(point[i] - centroid[i], 2);
+        }
+        return Math.sqrt(sum);
+    }
+
+    private static boolean predictStroke(int cluster) {
+        return cluster == 1;
+    }
+
+    private static List<double[]> loadCentroids() {
+        return Arrays.asList(
+            new double[]{0.5, 0, 0, 0.5, 0.33},  // Cụm không có nguy cơ đột quỵ
+            new double[]{0.7, 1, 1, 0.6, 0.67}   // Cụm có nguy cơ đột quỵ
+        );
+    }
+}
